@@ -1,101 +1,489 @@
+"""
+train.py
+========
+Standardized 300-Epoch Training Pipeline for MyoPS-Net Baseline.
+Protocol: myops380_train304_test76_last_v1
+Benchmark: MyoPS380 (304 Train / 76 Test / 300 Epochs / Strict NO Validation)
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+import json
+import logging
+import math
 import os
+from pathlib import Path
+import random
+import sys
+import time
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
+
+import numpy as np
 import torch
-from itertools import cycle
-import torch.optim as optim
+import torch.nn as nn
+
+# Ensure project root is in sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from criterion.loss import MyoPSLoss
-from utils.tools import weights_init
-from tensorboardX import SummaryWriter
-from torch.utils.data import DataLoader
-from network.model import MyoPSNet
-from validation import Validation2d
-from utils.dataloader import CrossModalDataLoader
+from dataset.augmentation import RandomGenerator
+from dataset.myops380_dataset import create_myops380_train_loader
+from network.model import MyoPSNetL
+from training.checkpoint import (
+    atomic_save_checkpoint,
+    capture_rng_state,
+    load_checkpoint,
+    restore_rng_state,
+    resume_checkpoint,
+    resume_training_state,
+    safe_atomic_save,
+    save_checkpoint,
+    validate_checkpoint_payload,
+)
+from training.optimizer import (
+    OPTIMIZATION_PROTOCOL,
+    build_optimizer,
+    build_scheduler,
+    calculate_total_updates,
+    compute_gradient_norm,
+)
+from training.provenance import (
+    INITIALIZATION, LOSS_CONTRACT, MODEL_CONTRACT, RNG_POLICY, build_resume_contract,
+)
+from utils.tools import create_multi_head_targets, weights_init
 
 
-def MyoPSNetTrain(args):
+def setup_logger(log_file: Path) -> logging.Logger:
+    """Configure console and file logging."""
+    logger = logging.getLogger("myopsnet.train")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers[:]:
+        handler.close()
+        logger.removeHandler(handler)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_h = logging.FileHandler(log_file, encoding="utf-8")
+    file_h.setFormatter(formatter)
+    stream_h = logging.StreamHandler(sys.stdout)
+    stream_h.setFormatter(formatter)
+    logger.addHandler(file_h)
+    logger.addHandler(stream_h)
+    return logger
 
-    # C0(5,3) LGE(2,3) T2(2,3) mapping(3,3)
-    model = MyoPSNet(in_chs=(5,2,2,3), out_chs=(3,3,3,3)).cuda()
-    model.apply(weights_init)
 
-    mlsc_loss = MyoPSLoss().cuda()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=5e-4)
-    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6, last_epoch=-1)
+def seed_everything(seed: int, deterministic: bool = True) -> None:
+    """Set deterministic random seed across all RNG backends."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
 
-    if not os.path.exists('checkpoints'):
-        os.makedirs('checkpoints')
 
-    Train_Image = CrossModalDataLoader(path=args.path, file_name='train.txt', dim=args.dim, max_iters=100*args.batch_size, stage='Train')
-    Train_loader = cycle(DataLoader(Train_Image, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True))
-  
-    Valid_Image = CrossModalDataLoader(path=args.path, file_name='validation.txt', dim=args.dim, max_iters=None, stage='Valid')
-    Valid_loader = cycle(DataLoader(Valid_Image, batch_size=1, shuffle=False, num_workers=0, drop_last=False))
+def resolve_device(device_name: str = "auto") -> torch.device:
+    """Resolve hardware execution device."""
+    if device_name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_name)
 
-    writer = SummaryWriter()
 
-    for epoch in range(args.start_epoch, args.end_epoch):
+def parse_amp_mode(amp_arg: Union[str, bool]) -> str:
+    """Normalize AMP string or boolean argument."""
+    if isinstance(amp_arg, bool):
+        return "auto" if amp_arg else "none"
+    s = str(amp_arg).strip().lower()
+    if s in ("true", "1", "yes", "auto"):
+        return "auto"
+    if s in ("false", "0", "no", "none"):
+        return "none"
+    if s in ("fp16", "bf16"):
+        return s
+    return "auto"
 
-        # Train
+
+def resolve_amp_dtype(amp_mode: str, device: torch.device) -> Optional[torch.dtype]:
+    """Resolve AMP autocast floating point dtype."""
+    if amp_mode == "none" or device.type == "cpu":
+        return None
+    if amp_mode == "auto":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if amp_mode == "fp16":
+        return torch.float16
+    if amp_mode == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            return torch.float16
+        return torch.bfloat16
+    return None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for training pipeline."""
+    parser = argparse.ArgumentParser(
+        description="Standardized Training Pipeline for MyoPS-Net on MyoPS380",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # Data paths
+    parser.add_argument("--data_root", "--data-root", default="D:/NCKH/Dataset/MyoPS380/Processed_data")
+    parser.add_argument("--split_dir", "--list_dir", default="D:/NCKH/SCAR/preprocessing/splits/myops380_no_val")
+    parser.add_argument("--run_dir", "--output_dir", default=None)
+
+    # Training recipe
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--epochs", "--max_epochs", type=int, default=300)
+    parser.add_argument("--batch_size", "--batch-size", type=int, default=16)
+    parser.add_argument("--base_lr", "--lr", type=float, default=0.0003333)
+    parser.add_argument("--weight_decay", "--weight-decay", type=float, default=0.0001)
+    parser.add_argument("--clip_grad", type=float, default=0.0)
+    parser.add_argument("--accum_steps", type=int, default=1)
+
+    # Hardware & precision
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--amp", default="auto", help="AMP mode: auto, fp16, bf16, none, or boolean True/False")
+    parser.add_argument("--no-amp", dest="amp", action="store_const", const="none", help="Disable AMP")
+    parser.add_argument("--num_workers", "--num-workers", type=int, default=4)
+    parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
+
+    # Checkpoint & logging
+    parser.add_argument("--resume", default=None, help="Path to checkpoint file or 'auto'")
+    parser.add_argument("--save_interval", type=int, default=1, help="Periodic checkpoint save frequency (epochs)")
+    parser.add_argument("--epochs_per_run", "--epochs-per-run", type=int, default=0,
+                        help="Pause after this many epochs without changing the planned LR budget (0 = finish)")
+    parser.add_argument("--log_interval", type=int, default=20, help="Batch logging frequency")
+    parser.add_argument("--tensorboard", action=argparse.BooleanOptionalAction, default=True)
+
+    # Fast verification / testing
+    parser.add_argument("--dry_run", "--smoke_test", action="store_true", help="Run 1 epoch of 2 batches for fast CI check")
+    parser.add_argument("--max_batches", type=int, default=0, help="Max batches per epoch (0 = unlimited)")
+
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """Main execution function for MyoPS-Net standardized training."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for key in ("epochs", "batch_size", "save_interval", "log_interval"):
+        if getattr(args, key) < 1:
+            parser.error(f"--{key} must be positive")
+    if args.num_workers < 0 or args.epochs_per_run < 0 or args.max_batches < 0:
+        parser.error("num_workers, epochs_per_run and max_batches must be nonnegative")
+    if args.accum_steps != 1:
+        parser.error("This multi-head training recipe requires --accum_steps 1")
+    resuming = args.resume is not None and str(args.resume).strip() != ""
+
+    # 1. Output directory setup
+    if args.run_dir is None:
+        run_dir = Path("runs") / f"myopsnet_seed{args.seed}"
+    else:
+        run_dir = Path(args.run_dir)
+    run_dir = run_dir.resolve()
+    if not resuming and run_dir.exists() and any(run_dir.iterdir()):
+        raise FileExistsError("Run directory is not empty; choose a new --run_dir or use --resume")
+
+    ckpt_dir = run_dir / "checkpoints"
+    log_dir = run_dir / "logs"
+    tb_dir = run_dir / "tensorboard"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = setup_logger(log_dir / "train.log")
+    checkpoint_path = ckpt_dir / f"myopsnet_seed{args.seed}.pt"
+
+    # 2. Hardware and seeding
+    seed_everything(args.seed, deterministic=args.deterministic)
+    device = resolve_device(args.device)
+    amp_mode = parse_amp_mode(args.amp)
+    amp_dtype = resolve_amp_dtype(amp_mode, device)
+    use_amp = (amp_dtype is not None)
+    pin_memory = (device.type == "cuda") if args.pin_memory is None else args.pin_memory
+
+    logger.info("=" * 70)
+    logger.info("MyoPS-Net Standardized Training Pipeline")
+    logger.info("Protocol: myops380_train304_test76_last_v1 | Opt Protocol: %s", OPTIMIZATION_PROTOCOL["id"])
+    logger.info("Run directory: %s", run_dir)
+    logger.info("Device: %s | AMP: %s (%s)", device, amp_mode, amp_dtype)
+    logger.info("Seed: %d | Batch size: %d | Planned epochs: %d", args.seed, args.batch_size, args.epochs)
+    logger.info("=" * 70)
+
+    # 3. DataLoader creation
+    split_file = Path(args.split_dir) / "train.txt"
+    transform = RandomGenerator(output_size=[128, 128])
+
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed)
+
+    train_loader = create_myops380_train_loader(
+        split_file=split_file,
+        data_root=args.data_root,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        transform=transform,
+        generator=loader_generator,
+    )
+    batches_per_epoch = len(train_loader)
+    logger.info("Loaded training data: %d slices across %d batches per epoch", len(train_loader.dataset), batches_per_epoch)
+    logger.info("Fingerprinting training cache and source for resume compatibility ...")
+    resume_contract = build_resume_contract(
+        args, train_loader.dataset, device=device, amp_dtype=amp_dtype, pin_memory=pin_memory,
+    )
+
+    # 4. Model, Criterion, Optimizer, Scheduler, Scaler
+    model = MyoPSNetL().to(device)
+    if not resuming:
+        model.apply(weights_init)
+    criterion = MyoPSLoss().to(device)
+    optimizer = build_optimizer(model, base_lr=args.base_lr, weight_decay=args.weight_decay)
+    total_updates = calculate_total_updates(args.epochs, batches_per_epoch, args.accum_steps)
+    scheduler = build_scheduler(optimizer, total_updates=total_updates)
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
+
+    # 5. Handle Resumption
+    start_epoch = 0
+    completed_epochs = 0
+    global_step = 0
+    amp_skipped_updates = 0
+
+    if resuming:
+        resume_target = checkpoint_path if str(args.resume).strip() in ("auto", "True", "true") else Path(args.resume)
+        if resume_target.is_file():
+            logger.info("Resuming training state from %s ...", resume_target)
+            res = resume_training_state(
+                checkpoint_path=resume_target,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                loader_generator=loader_generator,
+                device=device,
+                expected_resume_contract=resume_contract,
+            )
+            completed_epochs = res["completed_epochs"]
+            start_epoch = res["start_epoch"]
+            global_step = res["global_step"]
+            amp_skipped_updates = res["amp_skipped_updates"]
+            logger.info(
+                "Resumed state: completed_epochs=%d (next epoch=%d), global_step=%d, status=%s",
+                completed_epochs, start_epoch + 1, global_step, res["status"]
+            )
+            if res["status"] == "already_completed" or completed_epochs >= args.epochs:
+                logger.info("Training already complete (%d/%d epochs). Exiting cleanly.", completed_epochs, args.epochs)
+                return {
+                    "completed_epochs": completed_epochs,
+                    "global_step": global_step,
+                    "training_complete": True,
+                    "checkpoint_path": str(resume_target),
+                }
+        else:
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_target}")
+
+    # Write config metadata
+    config_record = {
+        "protocol_id": "myops380_train304_test76_last_v1",
+        "optimization_protocol": OPTIMIZATION_PROTOCOL,
+        "args": vars(args),
+        "total_updates": total_updates,
+        "model_parameters": sum(p.numel() for p in model.parameters()),
+        "device": str(device),
+        "amp_mode": amp_mode,
+        "amp_dtype": str(amp_dtype),
+        "model_contract": MODEL_CONTRACT,
+        "initialization": INITIALIZATION,
+        "loss_contract": LOSS_CONTRACT,
+        "rng_policy": RNG_POLICY,
+        "resume_contract": resume_contract,
+    }
+    with open(log_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config_record, f, indent=2)
+
+    # TensorBoard initialization
+    writer = None
+    if args.tensorboard:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            writer = SummaryWriter(log_dir=str(tb_dir / "epochs"))
+        except ImportError:
+            logger.warning("TensorBoard not installed. Telemetry written to CSV and JSONL only.")
+
+    target_epochs = 1 if args.dry_run else args.epochs
+    if args.epochs_per_run:
+        target_epochs = min(target_epochs, start_epoch + args.epochs_per_run)
+
+    # 6. Training Loop (Strict NO Validation)
+    logger.info("Starting training loop: epoch %d -> %d (target nominal: %d) ...", start_epoch + 1, target_epochs, args.epochs)
+
+    for epoch in range(start_epoch, target_epochs):
         model.train()
+        epoch_start_time = time.perf_counter()
+        running_loss_total = 0.0
+        running_loss_seg = 0.0
+        running_loss_inv = 0.0
+        running_loss_inc = 0.0
+        sample_count = 0
 
-        train_C0 = torch.FloatTensor(args.batch_size, 1, args.dim, args.dim).cuda()
-        train_LGE = torch.FloatTensor(args.batch_size, 1, args.dim, args.dim).cuda()
-        train_T2 = torch.FloatTensor(args.batch_size, 1, args.dim, args.dim).cuda()
-        train_T1m = torch.FloatTensor(args.batch_size, 1, args.dim, args.dim).cuda()
-        train_T2starm = torch.FloatTensor(args.batch_size, 1, args.dim, args.dim).cuda()
+        for batch_idx, batch in enumerate(train_loader):
+            if args.dry_run and batch_idx >= 2:
+                break
+            if args.max_batches > 0 and batch_idx >= args.max_batches:
+                break
 
-        cardiac_gd = torch.FloatTensor(args.batch_size, 3, args.dim, args.dim).cuda()
-        scar_gd = torch.FloatTensor(args.batch_size, 3, args.dim, args.dim).cuda()
-        edema_gd = torch.FloatTensor(args.batch_size, 3, args.dim, args.dim).cuda()
+            bSSFP = batch["bSSFP"].to(device, non_blocking=pin_memory)
+            LGE   = batch["LGE"].to(device, non_blocking=pin_memory)
+            T2w   = batch["T2w"].to(device, non_blocking=pin_memory)
+            label = batch["label"].to(device, non_blocking=pin_memory)
+            B = label.shape[0]
 
-        IterCount = int(len(Train_Image)/args.batch_size)
+            target_C0, target_LGE, target_T2 = create_multi_head_targets(label)
 
-        for iteration in range(IterCount):
-            
-            # Sup
-            img_C0, img_LGE, img_T2, img_T1m, img_T2starm, label_cardiac, label_scar, label_edema, _ = next(Train_loader) 
+            amp_enabled = (use_amp and device.type == "cuda")
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                seg_C0, seg_LGE, seg_T2 = model(bSSFP, LGE, T2w)
+                loss_total, loss_seg, loss_inv, loss_inc = criterion(
+                    seg_C0, seg_LGE, seg_T2, target_C0, target_LGE, target_T2
+                )
 
-            train_C0.copy_(img_C0)
-            train_LGE.copy_(img_LGE)
-            train_T2.copy_(img_T2)
-            train_T1m.copy_(img_T1m)
-            train_T2starm.copy_(img_T2starm)
+            if not torch.isfinite(loss_total):
+                raise FloatingPointError(
+                    f"Non-finite loss detected at epoch {epoch + 1}, batch {batch_idx + 1}: {loss_total.item()}"
+                )
 
-            cardiac_gd.copy_(label_cardiac)
-            scar_gd.copy_(label_scar)
-            edema_gd.copy_(label_edema)
+            scaler.scale(loss_total).backward()
 
-            seg_C0, seg_LGE, seg_T2, seg_mapping = model(train_C0, train_LGE, train_T2, train_T1m, train_T2starm)
+            is_boundary = ((batch_idx + 1) % args.accum_steps == 0) or ((batch_idx + 1) == batches_per_epoch)
+            if is_boundary:
+                scaler.unscale_(optimizer)
+                norm = compute_gradient_norm(
+                    model,
+                    clip_grad=args.clip_grad,
+                    error_if_nonfinite=not scaler.is_enabled(),
+                )
 
-            seg = {'C0': seg_C0, 'LGE': seg_LGE, 'T2': seg_T2, 'mapping': seg_mapping}
-            label = {'cardiac': cardiac_gd, 'scar': scar_gd, 'edema': edema_gd}
+                old_scale = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
 
-            loss_seg, loss_invariant, loss_inclusive, loss = mlsc_loss(seg, label)
+                skipped = (scaler.get_scale() < old_scale)
+                if not skipped:
+                    scheduler.step()
+                    global_step += 1
+                else:
+                    amp_skipped_updates += 1
+                    logger.warning(
+                        "Epoch [%03d/%03d] Batch [%03d/%03d] | Non-finite gradient norm (%.4f) detected with AMP scaler enabled; step skipped (scale reduced: %.1f -> %.1f, total skipped: %d).",
+                        epoch + 1, target_epochs, batch_idx + 1, batches_per_epoch,
+                        norm, old_scale, scaler.get_scale(), amp_skipped_updates,
+                    )
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            # write to log
-            with open('log_training.txt', 'a') as segment_log:
-                segment_log.write("==> Epoch: {:0>3d}/{:0>3d} || ".format(epoch + 1, args.end_epoch))
-                segment_log.write("Iteration: {:0>3d}/{:0>3d} - ".format(iteration + 1, IterCount))
-                segment_log.write("LR: {:.6f} | ".format(float(optimizer.param_groups[0]['lr'])))
-                segment_log.write("loss_seg: {:.6f} + ".format(loss_seg.detach().cpu()))
-                segment_log.write("loss_invariant: {:.6f} + ".format(loss_invariant.detach().cpu()))
-                segment_log.write("loss_inclusive: {:.6f} + ".format(loss_inclusive.detach().cpu()))
-                segment_log.write("loss: {:.6f}\n".format(loss.detach().cpu()))
-                
-            # write to tensorboard
-            writer.add_scalar('seg loss', loss_seg.detach().cpu(), epoch * (IterCount + 1) + iteration)
-            writer.add_scalar('invariant loss', loss_invariant.detach().cpu(), epoch * (IterCount + 1) + iteration)
-            writer.add_scalar('inclusive loss', loss_inclusive.detach().cpu(), epoch * (IterCount + 1) + iteration)
-            writer.add_scalar('total loss', loss.detach().cpu(), epoch * (IterCount + 1) + iteration)
+            running_loss_total += loss_total.item() * B
+            running_loss_seg += loss_seg.item() * B
+            running_loss_inv += loss_inv.item() * B
+            running_loss_inc += loss_inc.item() * B
+            sample_count += B
 
-        lr_scheduler.step()
+            if (batch_idx + 1) % args.log_interval == 0 or (batch_idx + 1) == batches_per_epoch or args.dry_run:
+                current_lr = optimizer.param_groups[0]["lr"]
+                logger.info(
+                    "Epoch [%03d/%03d] Batch [%03d/%03d] | Total Loss: %.5f (Seg: %.4f, Inv: %.4f, Inc: %.4f) | LR: %.7f | Step: %d",
+                    epoch + 1, target_epochs, batch_idx + 1, batches_per_epoch,
+                    loss_total.item(), loss_seg.item(), loss_inv.item(), loss_inc.item(),
+                    current_lr, global_step
+                )
 
-        # Validation
-        model.eval()
-        avg_dice_2d = Validation2d(args, epoch, model, Valid_Image, Valid_loader, writer, 'result_validation_2d.txt', tensorboardImage=True)
+        epoch_duration = time.perf_counter() - epoch_start_time
+        completed_epochs = epoch + 1
+        mean_loss = running_loss_total / max(sample_count, 1)
+        mean_seg = running_loss_seg / max(sample_count, 1)
+        mean_inv = running_loss_inv / max(sample_count, 1)
+        mean_inc = running_loss_inc / max(sample_count, 1)
+        current_lr = optimizer.param_groups[0]["lr"]
 
-        if avg_dice_2d > args.threshold:
-            torch.save(model.state_dict(), os.path.join('checkpoints', str(avg_dice_2d) + '['+ str(epoch+1) + '].pth'))
+        logger.info(
+            "--> Epoch [%03d/%03d] Finished in %.2fs | Mean Loss: %.5f | LR: %.7f",
+            completed_epochs, target_epochs, epoch_duration, mean_loss, current_lr
+        )
+
+        # Also save at a session boundary so epochs_per_run can resume exactly.
+        is_save_epoch = (
+            (completed_epochs % args.save_interval == 0)
+            or (completed_epochs == args.epochs)
+            or (args.dry_run and completed_epochs == 1)
+            or (completed_epochs == target_epochs)
+        )
+        if is_save_epoch:
+            logger.info("Saving atomic checkpoint to %s (epoch %d) ...", checkpoint_path, completed_epochs)
+            save_checkpoint(
+                checkpoint_path=checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=completed_epochs,
+                completed_epochs=completed_epochs,
+                planned_epochs=args.epochs,
+                global_step=global_step,
+                total_updates=total_updates,
+                seed=args.seed,
+                args=args,
+                amp_skipped_updates=amp_skipped_updates,
+                loader_generator=loader_generator,
+                resume_contract=resume_contract,
+                model_contract=MODEL_CONTRACT,
+                initialization=INITIALIZATION,
+                loss_contract=LOSS_CONTRACT,
+                rng_policy=RNG_POLICY,
+            )
+
+        # Record tabular metrics
+        record = {
+            "epoch": completed_epochs,
+            "global_step": global_step,
+            "train/loss": mean_loss,
+            "train/loss_seg": mean_seg,
+            "train/loss_inv": mean_inv,
+            "train/loss_inc": mean_inc,
+            "train/lr": current_lr,
+            "epoch_seconds": epoch_duration,
+            "amp_skipped_updates": amp_skipped_updates,
+            "training_complete": (completed_epochs >= args.epochs),
+        }
+
+        with open(log_dir / "metrics.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        csv_path = log_dir / "metrics.csv"
+        csv_exists = csv_path.is_file() and csv_path.stat().st_size > 0
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer_csv = csv.DictWriter(f, fieldnames=list(record.keys()))
+            if not csv_exists:
+                writer_csv.writeheader()
+            writer_csv.writerow(record)
+
+        if writer:
+            for k, v in record.items():
+                if isinstance(v, (int, float)):
+                    writer.add_scalar(k, v, completed_epochs)
+
+    if writer:
+        writer.close()
+
+    is_complete = (completed_epochs >= args.epochs)
+    logger.info("Training session finished. Checkpoint: %s (completed: %s)", checkpoint_path, is_complete)
+    return {
+        "completed_epochs": completed_epochs,
+        "global_step": global_step,
+        "training_complete": is_complete,
+        "checkpoint_path": str(checkpoint_path),
+    }
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,30 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Experiment outputs, logs, & model weights
+runs/
+output/
+outputs/
+*.pt
+*.pth
+*.npz
+*.npy
+*.h5
+*.nii
+*.nii.gz
+
+# Environment & IDE
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+
+# Agent teamwork logs & local temp
+.agents/
+tmp/
+*.log
