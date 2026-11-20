@@ -268,6 +268,8 @@ def resolve_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, Pat
         checkpoint_path = Path(args.checkpoint).resolve()
     else:
         checkpoint_path = run_dir / "checkpoints" / f"myopsnet_seed{args.seed}.pt"
+        if not checkpoint_path.is_file() and (run_dir / f"myopsnet_seed{args.seed}.pt").is_file():
+            checkpoint_path = run_dir / f"myopsnet_seed{args.seed}.pt"
 
     if args.pred_dir is not None:
         pred_dir = Path(args.pred_dir).resolve()

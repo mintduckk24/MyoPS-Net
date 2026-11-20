@@ -520,6 +520,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         record = {
             "epoch": completed_epochs,
             "global_step": global_step,
+            "seed": args.seed,
             "train/loss": mean_loss,
             "train/loss_seg": mean_seg,
             "train/loss_inv": mean_inv,
@@ -560,7 +561,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                 for line in f:
                     if line.strip():
                         rec = json.loads(line.strip())
-                        if "epoch_seconds" in rec:
+                        if ("seed" not in rec or rec.get("seed") == args.seed) and "epoch_seconds" in rec:
                             epoch_times.append(float(rec["epoch_seconds"]))
         except Exception as e:
             logger.warning("Could not read epoch times from metrics.jsonl: %s", e)

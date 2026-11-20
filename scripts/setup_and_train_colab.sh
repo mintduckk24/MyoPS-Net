@@ -87,7 +87,7 @@ if not os.path.exists('/content/drive/MyDrive'):
 # === BƯỚC 3/7: THIẾT LẬP REPOSITORY MYOPS-NET ===
 echo ""
 echo "=== [3/7] Thiết lập Repository MyoPS-Net ==="
-REPO_URL="https://github.com/thanhquan123hi1/MyoPS-Net.git"
+REPO_URL="https://github.com/mintduckk24/MyoPS-Net.git"
 
 if [ -f "./train.py" ] && [ -d "./network" ]; then
     echo "✅ Đang đứng trực tiếp trong thư mục MyoPS-Net."

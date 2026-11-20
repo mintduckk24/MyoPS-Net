@@ -117,7 +117,7 @@ def safe_atomic_save(payload: Dict[str, Any], filepath: Union[str, Path]) -> Non
             f.flush()
             os.fsync(f.fileno())
 
-        max_retries = 5
+        max_retries = 20
         for attempt in range(max_retries):
             try:
                 os.replace(tmp_path, target_path)
@@ -125,7 +125,7 @@ def safe_atomic_save(payload: Dict[str, Any], filepath: Union[str, Path]) -> Non
             except (PermissionError, OSError) as exc:
                 if attempt == max_retries - 1:
                     raise exc
-                time.sleep(0.05 * (2 ** attempt))
+                time.sleep(min(0.15 * (1.3 ** attempt), 1.5))
     except Exception:
         if tmp_path.exists():
             try:
