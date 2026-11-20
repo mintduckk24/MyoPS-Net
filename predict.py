@@ -215,9 +215,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for predictions (defaults to <run_dir>/test_predictions)",
     )
 
-    # Data paths
-    parser.add_argument("--data_root", "--data-root", default="D:/NCKH/Dataset/MyoPS380/Processed_data", help="Dataset root containing bSSFP, LGE, T2w test_vol_h5")
-    parser.add_argument("--split_dir", "--list_dir", default="D:/NCKH/SCAR/preprocessing/splits/myops380_no_val", help="Directory containing test_vol.txt")
+    # Data paths & dataset selection
+    parser.add_argument("--dataset", default="auto", choices=["auto", "myops380", "myopspp_unet2d_roi128_1mm"], help="Dataset identifier: auto, myops380, or myopspp_unet2d_roi128_1mm")
+    parser.add_argument("--data_root", "--data-root", "--data_dir", "--data-dir", default="D:/NCKH/Dataset/MyoPS380/Processed_data", help="Dataset root containing bSSFP, LGE, T2w test_vol_h5 or MyoPS++ cases")
+    parser.add_argument("--split_dir", "--list_dir", "--split-dir", default="D:/NCKH/SCAR/preprocessing/splits/myops380_no_val", help="Directory containing test_vol.txt")
     parser.add_argument("--split", default="test_vol", help="Split name to evaluate (default: test_vol)")
     parser.add_argument("--test_manifest", default=None, help="Direct path to test manifest file (overrides --split_dir/--split.txt)")
 
@@ -237,8 +238,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def resolve_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path]:
-    """Resolves checkpoint path, run directory, predictions output directory, and manifest path."""
+def resolve_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, Path, str, str]:
+    """Resolves checkpoint path, run directory, predictions output directory, manifest path, and dataset info."""
+    from utils.paths import resolve_data_root, resolve_split_dir
+
+    resolved_data_root = resolve_data_root(args.data_root, dataset=args.dataset)
+    resolved_split_dir = resolve_split_dir(args.split_dir, dataset=args.dataset, data_root=resolved_data_root)
+
+    is_myopspp = (
+        "myopspp" in str(args.dataset).lower()
+        or "myopspp" in str(resolved_data_root).lower()
+        or "myopspp" in str(resolved_split_dir).lower()
+    )
+    dataset_id = "myopspp_unet2d_roi128_1mm" if is_myopspp else "myops380"
+    benchmark_protocol_id = f"{dataset_id}_roi_mm_v2" if is_myopspp else "myops380_voxel_v3"
+
     if args.run_dir is not None:
         run_dir = Path(args.run_dir).resolve()
     elif args.checkpoint is not None:
@@ -263,28 +277,35 @@ def resolve_paths(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path]:
     if args.test_manifest is not None:
         manifest_path = Path(args.test_manifest).resolve()
     else:
-        split_p = Path(args.split_dir).resolve()
+        split_p = Path(resolved_split_dir).resolve()
         if split_p.is_file():
             manifest_path = split_p
         else:
             manifest_path = split_p / f"{args.split}.txt"
+        if not manifest_path.is_file():
+            local_cand = PROJECT_ROOT / "dataset" / "splits" / dataset_id / f"{args.split}.txt"
+            if not local_cand.is_file():
+                local_cand = PROJECT_ROOT / "preprocessing" / "splits" / dataset_id / f"{args.split}.txt"
+            if local_cand.is_file():
+                manifest_path = local_cand
 
-    return checkpoint_path, run_dir, pred_dir, manifest_path
+    return checkpoint_path, run_dir, pred_dir, manifest_path, resolved_data_root, dataset_id, benchmark_protocol_id
 
 
 def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    """Executes standardized volume inference pipeline on MyoPS380 test cases."""
+    """Executes standardized volume inference pipeline on MyoPS380 and MyoPS++ test cases."""
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    checkpoint_path, run_dir, pred_dir, manifest_path = resolve_paths(args)
+    checkpoint_path, run_dir, pred_dir, manifest_path, resolved_data_root, dataset_id, benchmark_protocol_id = resolve_paths(args)
     pred_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_inference_logger(pred_dir / "predict.log")
 
     logger.info("=" * 75)
     logger.info("MyoPS-Net Standardized Volume Inference Pipeline")
-    logger.info("Protocol: %s | Benchmark: %s", TRAINING_PROTOCOL_ID, BENCHMARK_PROTOCOL_ID)
+    logger.info("Protocol: %s | Benchmark: %s | Dataset: %s", TRAINING_PROTOCOL_ID, benchmark_protocol_id, dataset_id)
     logger.info("Checkpoint: %s", checkpoint_path)
+    logger.info("Data Root: %s", resolved_data_root)
     logger.info("Manifest: %s", manifest_path)
     logger.info("Prediction Output Dir: %s", pred_dir)
     logger.info("=" * 75)
@@ -320,9 +341,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     # 3. Load Test Dataset
     dataset = MyoPS380TestDataset(
         split_file=manifest_path,
-        data_root=args.data_root,
+        data_root=resolved_data_root,
         canonical_label=False,
         strict=args.strict,
+        dataset=dataset_id,
     )
     all_cases = dataset.cases
     logger.info("Found %d test volumes in manifest", len(all_cases))
@@ -382,21 +404,26 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
 
         # Save canonical .npz file
         npz_out = pred_dir / f"{case_id}_pred.npz"
-        np.savez_compressed(
-            npz_out,
-            prediction=prediction,
-            case_id=case_id,
-            class_names=np.asarray(CLASS_NAMES),
-            shape=np.asarray(prediction.shape),
-            protocol_id=TRAINING_PROTOCOL_ID,
-            benchmark_protocol=BENCHMARK_PROTOCOL_ID,
-        )
+        npz_dict = {
+            "prediction": prediction,
+            "case_id": case_id,
+            "class_names": np.asarray(CLASS_NAMES),
+            "shape": np.asarray(prediction.shape),
+            "protocol_id": TRAINING_PROTOCOL_ID,
+            "benchmark_protocol": benchmark_protocol_id,
+        }
+        if "spacing" in sample and sample["spacing"] is not None:
+            npz_dict["spacing"] = sample["spacing"]
+        if "affine" in sample and sample["affine"] is not None:
+            npz_dict["affine"] = sample["affine"]
+        np.savez_compressed(npz_out, **npz_dict)
 
         # Optional NIfTI export
         if args.save_nii:
             try:
                 import nibabel as nib
-                nii = nib.Nifti1Image(prediction, np.eye(4, dtype=np.float32))
+                aff = sample.get("affine", np.eye(4, dtype=np.float32))
+                nii = nib.Nifti1Image(prediction, aff)
                 nib.save(nii, pred_dir / f"{case_id}_pred.nii.gz")
             except ImportError:
                 logger.warning("nibabel not installed; skipping .nii.gz export")

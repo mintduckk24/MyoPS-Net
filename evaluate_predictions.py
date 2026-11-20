@@ -1,8 +1,11 @@
 """
 evaluate_predictions.py — Standalone Benchmark Prediction Evaluation
 ===================================================================
-Protocol: myops380_voxel_v3 (Exact SCAR Parity)
-Evaluates test patient volumes across 5 target regions:
+Protocols:
+  - myopspp_roi_mm_v2 (MyoPS++ ROI 128x128 1mm benchmark, physical mm distances)
+  - myops380_voxel_v3 (MyoPS380 benchmark, voxel distances)
+
+Evaluates test patient volumes across 5 canonical target regions:
   1. Myocardium (MYO / myocardial_ring): IDs [1, 2, 3]
   2. Edema (EDEMA / edema): ID [2] (exclusive)
   3. Scar (SCAR / scar): ID [3]
@@ -11,7 +14,7 @@ Evaluates test patient volumes across 5 target regions:
 
 Outputs:
   - <output_dir>/per_case.csv          (patient rows + Mean, Std, Median)
-  - <output_dir>/per_case_detailed.csv (380-row long format, exact SCAR schema)
+  - <output_dir>/per_case_detailed.csv (detailed long format)
   - <output_dir>/metrics.json          (benchmark summary metrics & counts)
 """
 
@@ -23,6 +26,7 @@ import csv
 import json
 import logging
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -30,6 +34,22 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import h5py
 import numpy as np
 from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
+
+try:
+    import nibabel as nib
+except ImportError:
+    nib = None
+
+# Ensure local utils package is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from utils.paths import resolve_data_root, resolve_split_dir
+except ImportError:
+    def resolve_data_root(candidate=None, dataset="auto"):
+        return Path(candidate) if candidate else Path(".")
+
+    def resolve_split_dir(candidate=None, dataset="auto", data_root=None):
+        return Path(candidate) if candidate else Path(".")
 
 
 # Canonical benchmark protocol descriptor
@@ -60,7 +80,16 @@ BENCHMARK_PROTOCOL = {
 }
 
 CANONICAL_LUT = np.array([0, 1, 3, 2], dtype=np.uint8)
-EXPECTED_TEST_CASES = 76
+
+
+def canonicalize_raw_myopspp(label: np.ndarray) -> np.ndarray:
+    """Maps raw MyoPS++ labels (0, 200, 500, 600, 1220, 2221) to canonical 0..3."""
+    raw = np.asarray(label, dtype=np.int64)
+    out = np.zeros_like(raw, dtype=np.int64)
+    out[raw == 200] = 1   # Normal myocardium
+    out[raw == 1220] = 2  # Edema
+    out[raw == 2221] = 3  # Scar
+    return out
 
 
 def setup_logger(output_dir: Path) -> logging.Logger:
@@ -171,10 +200,14 @@ def evaluate_single_volume(
     spacing: Optional[Sequence[float]] = None,
     compute_distance: bool = True,
     empty_mode: str = "excluded",
+    is_canonical_gt: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Evaluates one patient volume across all 5 regions."""
-    # Convert GT from legacy order to canonical order
-    target = CANONICAL_LUT[target_raw.astype(int)]
+    if is_canonical_gt:
+        target = target_raw.astype(int)
+    else:
+        # Convert GT from legacy order to canonical order: [0->0, 1->1, 2(scar)->3, 3(edema)->2]
+        target = CANONICAL_LUT[target_raw.astype(int)]
 
     detailed_rows = []
     case_summary: Dict[str, Any] = {"case_id": case_id}
@@ -302,8 +335,8 @@ def compute_cohort_summary(
     return summary, summary_rows
 
 
-def load_prediction_volume(pred_dir: Path, case_id: str) -> np.ndarray:
-    """Finds and loads the 3D uint8 canonical prediction array."""
+def load_prediction_volume(pred_dir: Path, case_id: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Finds and loads the 3D uint8 canonical prediction array and optional spacing."""
     candidates = [
         pred_dir / f"{case_id}_pred.npz",
         pred_dir / f"{case_id}.npz",
@@ -312,21 +345,77 @@ def load_prediction_volume(pred_dir: Path, case_id: str) -> np.ndarray:
     for p in candidates:
         if p.is_file():
             with np.load(p) as data:
+                pred = None
                 for k in ("prediction", "pred", "arr_0"):
                     if k in data:
-                        return np.asarray(data[k], dtype=np.uint8)
+                        pred = np.asarray(data[k], dtype=np.uint8)
+                        break
+                if pred is not None:
+                    spacing = np.asarray(data["spacing"], dtype=float) if "spacing" in data else None
+                    return pred, spacing
     raise FileNotFoundError(f"No prediction file found for {case_id} in {pred_dir}")
 
 
-def load_ground_truth_volume(data_root: Path, case_id: str, modality: str = "bSSFP") -> np.ndarray:
-    """Loads raw ground truth label volume from H5."""
+def load_ground_truth_volume(
+    data_root: Path,
+    case_id: str,
+    modality: str = "bSSFP",
+    dataset: str = "auto",
+    label_order: str = "auto",
+) -> Tuple[np.ndarray, Optional[np.ndarray], bool]:
+    """Loads ground truth volume, returning (gt_array, spacing, is_already_canonical)."""
+    # 1. Check MyoPS++ NIfTI structure
+    center = "CenterB" if case_id.startswith("Case2") else "CenterC"
+    nifti_candidates = [
+        data_root / "cases" / center / case_id / f"{case_id}_gd.nii.gz",
+        data_root / "cases" / case_id / f"{case_id}_gd.nii.gz",
+        data_root / center / case_id / f"{case_id}_gd.nii.gz",
+        data_root / case_id / f"{case_id}_gd.nii.gz",
+        data_root / f"{case_id}_gd.nii.gz",
+        data_root / "MyoPSpp_UNet2D_ROI128_1mm" / "cases" / center / case_id / f"{case_id}_gd.nii.gz",
+        data_root / "MyoPSpp_UNet2D_ROI128_1mm" / "cases" / case_id / f"{case_id}_gd.nii.gz",
+    ]
+    for cand in nifti_candidates:
+        if cand.is_file():
+            if nib is None:
+                raise ImportError("nibabel is required to load MyoPS++ NIfTI ground truth.")
+            lbl_nib = nib.load(str(cand))
+            raw_lbl = np.asarray(lbl_nib.dataobj)
+            spacing = None
+
+            # Read spacing from metadata.json or NIfTI zooms
+            meta_json = cand.parent / "metadata.json"
+            if meta_json.is_file():
+                try:
+                    meta = json.loads(meta_json.read_text(encoding="utf-8"))
+                    if "output_spacing_mm" in meta:
+                        spacing = np.asarray(meta["output_spacing_mm"], dtype=float)
+                    elif "native_spacing_mm" in meta:
+                        spacing = np.asarray(meta["native_spacing_mm"], dtype=float)
+                except Exception:
+                    pass
+            if spacing is None:
+                c0_cand = cand.parent / f"{case_id}_C0.nii.gz"
+                if c0_cand.is_file():
+                    c0_nib = nib.load(str(c0_cand))
+                    spacing = np.asarray(c0_nib.header.get_zooms()[:3], dtype=float)
+                else:
+                    spacing = np.asarray(lbl_nib.header.get_zooms()[:3], dtype=float)
+
+            # Map raw labels (200->1, 1220->2, 2221->3)
+            if raw_lbl.max() > 3:
+                gt_canonical = canonicalize_raw_myopspp(raw_lbl)
+            else:
+                gt_canonical = raw_lbl
+            return gt_canonical, spacing, True
+
+    # 2. Check MyoPS380 H5 structure
     candidates = [
         data_root / modality / "test_vol_h5" / f"{case_id}.npy.h5",
         data_root / modality / "test_vol_h5" / f"{case_id}.h5",
         data_root / "test_vol_h5" / f"{case_id}.npy.h5",
         data_root / "test_vol_h5" / f"{case_id}.h5",
     ]
-    # Also check other modalities if primary modality does not contain label
     for alt_mod in ("bSSFP", "LGE", "T2w"):
         candidates.append(data_root / alt_mod / "test_vol_h5" / f"{case_id}.npy.h5")
 
@@ -334,7 +423,9 @@ def load_ground_truth_volume(data_root: Path, case_id: str, modality: str = "bSS
         if p.is_file():
             with h5py.File(p, "r") as f:
                 if "label" in f:
-                    return np.asarray(f["label"][:], dtype=np.float32)
+                    raw_gt = np.asarray(f["label"][:], dtype=np.int64)
+                    is_canonical = (label_order == "canonical")
+                    return raw_gt, None, is_canonical
 
     raise FileNotFoundError(f"No GT label found for {case_id} in {data_root}")
 
@@ -349,6 +440,8 @@ def evaluate_dataset(
     compute_distance: bool = True,
     cases: Optional[Sequence[str]] = None,
     empty_mode: str = "excluded",
+    dataset: str = "auto",
+    label_order: str = "auto",
 ) -> Dict[str, Any]:
     """Evaluates all cases in split against predictions."""
     pred_dir = Path(predictions_dir).resolve()
@@ -357,20 +450,41 @@ def evaluate_dataset(
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    is_myopspp = (
+        "myopspp" in str(data_root).lower()
+        or "myopspp" in str(split_path).lower()
+        or "myopspp" in str(dataset).lower()
+        or (data_root / "cases").is_dir()
+    )
+    dataset_id = "myopspp_unet2d_roi128_1mm" if is_myopspp else "myops380"
+    expected_cases = 16 if is_myopspp else 76
+    metric_protocol_id = "myopspp_roi_mm_v2" if is_myopspp else "myops380_voxel_v3"
+    benchmark_protocol = "myopspp_roi128_train64_test16_no_val_v1" if is_myopspp else "myops380_train304_test76_last_v1"
+
     logger = setup_logger(out_dir)
-    logger.info("Initializing prediction evaluation under protocol %s", BENCHMARK_PROTOCOL["id"])
+    logger.info("Initializing prediction evaluation under protocol %s (Dataset: %s)", metric_protocol_id, dataset_id)
     logger.info("Predictions dir: %s", pred_dir)
     logger.info("Data root: %s", data_root)
     logger.info("Split path: %s", split_path)
     logger.info("Output dir: %s", out_dir)
 
     # Resolve case IDs
+    if not split_path.exists():
+        repo_root = Path(__file__).resolve().parent
+        if is_myopspp:
+            cand = repo_root / "dataset" / "splits" / "myopspp_unet2d_roi128_1mm" / "test_vol.txt"
+        else:
+            cand = repo_root / "preprocessing" / "splits" / "myops380_no_val" / "test_vol.txt"
+        if cand.is_file():
+            split_path = cand
+            logger.info("Using repository split file: %s", split_path)
+
     if cases is not None and len(cases) > 0:
         case_ids = list(cases)
     elif split_path.is_file():
         case_ids = [
-            line.strip().replace(".npy.h5", "").replace(".h5", "")
-            for line in split_path.read_text(encoding="utf-8").splitlines()
+            line.strip().replace(".npy.h5", "").replace(".h5", "").replace(".nii.gz", "").replace(".nii", "")
+            for line in split_path.read_text(encoding="utf-8-sig").splitlines()
             if line.strip()
         ]
     elif split_path.is_dir():
@@ -379,8 +493,8 @@ def evaluate_dataset(
             cand = split_path / "test.txt"
         if cand.is_file():
             case_ids = [
-                line.strip().replace(".npy.h5", "").replace(".h5", "")
-                for line in cand.read_text(encoding="utf-8").splitlines()
+                line.strip().replace(".npy.h5", "").replace(".h5", "").replace(".nii.gz", "").replace(".nii", "")
+                for line in cand.read_text(encoding="utf-8-sig").splitlines()
                 if line.strip()
             ]
         else:
@@ -388,25 +502,32 @@ def evaluate_dataset(
     else:
         raise FileNotFoundError(f"Split file or directory not found: {split_path}")
 
-    if len(case_ids) != EXPECTED_TEST_CASES:
-        logger.warning("Expected %d test cases, found %d in %s", EXPECTED_TEST_CASES, len(case_ids), split_path)
+    if len(case_ids) != expected_cases:
+        logger.warning("Expected %d test cases for %s, found %d in %s", expected_cases, dataset_id, len(case_ids), split_path)
 
     all_detailed_rows = []
     all_case_summaries = []
-    distance_unit = "mm" if spacing is not None else "voxel"
+    effective_distance_unit = "mm" if (spacing is not None or is_myopspp) else "voxel"
 
     t0 = time.perf_counter()
     for idx, case_id in enumerate(case_ids, 1):
-        pred = load_prediction_volume(pred_dir, case_id)
-        gt_raw = load_ground_truth_volume(data_root, case_id, modality=modality)
+        pred, pred_spacing = load_prediction_volume(pred_dir, case_id)
+        gt_raw, gt_spacing, is_canonical = load_ground_truth_volume(
+            data_root, case_id, modality=modality, dataset=dataset_id, label_order=label_order
+        )
+
+        case_spacing = spacing if spacing is not None else (pred_spacing if pred_spacing is not None else gt_spacing)
+        if case_spacing is not None:
+            effective_distance_unit = "mm"
 
         detailed_rows, case_summary = evaluate_single_volume(
             pred,
             gt_raw,
             case_id,
-            spacing=spacing,
+            spacing=case_spacing,
             compute_distance=compute_distance,
             empty_mode=empty_mode,
+            is_canonical_gt=is_canonical,
         )
         all_detailed_rows.extend(detailed_rows)
         all_case_summaries.append(case_summary)
@@ -429,7 +550,7 @@ def evaluate_dataset(
     summary, summary_rows = compute_cohort_summary(
         all_detailed_rows,
         all_case_summaries,
-        distance_unit=distance_unit,
+        distance_unit=effective_distance_unit,
     )
 
     # 1. Write per_case.csv (patient rows + Mean, Std, Median)
@@ -442,31 +563,31 @@ def evaluate_dataset(
         writer.writerows(summary_rows)
     logger.info("Saved patient-level wide CSV to %s", per_case_csv)
 
-    # 2. Write per_case_detailed.csv (SCAR-parity long format)
+    # 2. Write per_case_detailed.csv (detailed long format)
     per_case_detailed_csv = out_dir / "per_case_detailed.csv"
     with open(per_case_detailed_csv, "w", newline="", encoding="utf-8") as f:
         fieldnames = list(all_detailed_rows[0].keys())
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_detailed_rows)
-    logger.info("Saved detailed SCAR-parity CSV to %s", per_case_detailed_csv)
+    logger.info("Saved detailed CSV to %s", per_case_detailed_csv)
 
     # 3. Write metrics.json
     summary["metadata"] = {
-        "protocol_id": "myops380_train304_test76_last_v1",
-        "metric_protocol": "myops380_voxel_v3",
-        "dataset_id": "myops380",
+        "protocol_id": benchmark_protocol,
+        "metric_protocol": metric_protocol_id,
+        "dataset_id": dataset_id,
         "case_count": len(case_ids),
-        "distance_unit": distance_unit,
+        "distance_unit": effective_distance_unit,
         "evaluation_seconds": round(elapsed, 4),
         "primary_selection_metric": BENCHMARK_PROTOCOL["selection_metric"],
         "primary_selection_value": summary.get(BENCHMARK_PROTOCOL["selection_metric"]),
     }
-    summary["benchmark_protocol"] = BENCHMARK_PROTOCOL["id"]
-    summary["metric_protocol"] = BENCHMARK_PROTOCOL["id"]
-    summary["dataset_id"] = "myops380"
+    summary["benchmark_protocol"] = benchmark_protocol
+    summary["metric_protocol"] = metric_protocol_id
+    summary["dataset_id"] = dataset_id
     summary["case_count"] = len(case_ids)
-    summary["distance_unit"] = distance_unit
+    summary["distance_unit"] = effective_distance_unit
 
     metrics_json = out_dir / "metrics.json"
     with open(metrics_json, "w", encoding="utf-8") as f:
@@ -475,6 +596,8 @@ def evaluate_dataset(
 
     # Log summary table
     logger.info("======================= BENCHMARK SUMMARY =======================")
+    logger.info("Dataset ID:                                     %s", dataset_id)
+    logger.info("Metric Protocol:                                %s", metric_protocol_id)
     logger.info("Avg Pathology Inclusive Dice (Primary Selection): %s", summary.get("avg_pathology_inclusive_dice"))
     logger.info("Avg Pathology Exclusive Dice:                   %s", summary.get("avg_pathology_dice"))
     for r in ("myocardial_ring", "edema", "scar", "edema_inclusive", "normal_myocardium"):
@@ -485,8 +608,8 @@ def evaluate_dataset(
             f"{st['mean_dice']:.4f}" if st['mean_dice'] is not None else "None",
             st['dice_defined_cases'],
             st['cases'],
-            f"{st[f'mean_hd95_{distance_unit}']:.3f}" if st[f'mean_hd95_{distance_unit}'] is not None else "None",
-            distance_unit,
+            f"{st[f'mean_hd95_{effective_distance_unit}']:.3f}" if st[f'mean_hd95_{effective_distance_unit}'] is not None else "None",
+            effective_distance_unit,
         )
     logger.info("================================================================")
 
@@ -496,7 +619,7 @@ def evaluate_dataset(
 def build_parser() -> argparse.ArgumentParser:
     """Builds CLI argument parser for evaluate_predictions.py."""
     parser = argparse.ArgumentParser(
-        description="Evaluate MyoPS380 3D test volume predictions under protocol myops380_voxel_v3.",
+        description="Evaluate MyoPS 3D test volume predictions under benchmark protocols.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -512,16 +635,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Experiment run directory (infers pred_dir and output_dir)",
     )
     parser.add_argument(
-        "--data_root", "--data-root",
-        default="D:/NCKH/Dataset/MyoPS380/Processed_data",
+        "--data_root", "--data-root", "--data_dir", "--data-dir",
+        default=None,
         dest="data_root",
-        help="Path to Processed_data root directory",
+        help="Path to dataset root directory (resolves automatically if omitted)",
     )
     parser.add_argument(
         "--split_dir", "--split-dir", "--split_file", "--split-file",
-        default="D:/NCKH/SCAR/preprocessing/splits/myops380_no_val/test_vol.txt",
+        default=None,
         dest="split_path",
         help="Path to test_vol.txt or directory containing test_vol.txt",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["auto", "myops380", "myopspp_unet2d_roi128_1mm", "myopspp"],
+        default="auto",
+        help="Dataset benchmark identifier: 'myopspp_unet2d_roi128_1mm' or 'myops380'",
+    )
+    parser.add_argument(
+        "--label_order",
+        choices=["auto", "canonical", "legacy"],
+        default="auto",
+        help="Ground truth label ordering standard ('canonical' for MyoPS++, 'legacy' for MyoPS380)",
     )
     parser.add_argument(
         "--output_dir", "--output-dir",
@@ -551,13 +686,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--cases",
         nargs="+",
         default=None,
-        help="Explicit list of CaseIDs to evaluate (e.g. --cases case0001 case0006)",
+        help="Explicit list of CaseIDs to evaluate (e.g. --cases Case2_001 Case2_002)",
     )
     parser.add_argument(
         "--empty_mode",
         choices=["excluded", "defined"],
         default="excluded",
-        help="Empty mask handling mode: excluded (SCAR benchmark standard) or defined",
+        help="Empty mask handling mode: excluded (benchmark standard) or defined",
     )
     return parser
 
@@ -577,16 +712,22 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         pred_dir = Path(args.pred_dir).resolve()
         output_dir = Path(args.output_dir).resolve() if args.output_dir else pred_dir.parent / "evaluation"
 
+    # Resolve data_root and split_dir
+    resolved_data_root = resolve_data_root(args.data_root, dataset=args.dataset)
+    resolved_split_dir = resolve_split_dir(args.split_path, dataset=args.dataset, data_root=resolved_data_root)
+
     return evaluate_dataset(
         predictions_dir=pred_dir,
-        data_root=args.data_root,
-        split_file=args.split_path,
+        data_root=resolved_data_root,
+        split_file=resolved_split_dir,
         output_dir=output_dir,
         spacing=args.spacing,
         modality=args.modality,
         compute_distance=not args.no_distance,
         cases=args.cases,
         empty_mode=args.empty_mode,
+        dataset=args.dataset,
+        label_order=args.label_order,
     )
 
 

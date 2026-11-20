@@ -124,13 +124,17 @@ def resolve_amp_dtype(amp_mode: str, device: torch.device) -> Optional[torch.dty
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI parser for training pipeline."""
     parser = argparse.ArgumentParser(
-        description="Standardized Training Pipeline for MyoPS-Net on MyoPS380",
+        description="Standardized Training Pipeline for MyoPS-Net on MyoPS380 and MyoPS++",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # Data paths
-    parser.add_argument("--data_root", "--data-root", default="D:/NCKH/Dataset/MyoPS380/Processed_data")
-    parser.add_argument("--split_dir", "--list_dir", default="D:/NCKH/SCAR/preprocessing/splits/myops380_no_val")
-    parser.add_argument("--run_dir", "--output_dir", default=None)
+    # Data paths & benchmark selection
+    parser.add_argument("--dataset", default="auto", choices=["auto", "myops380", "myopspp_unet2d_roi128_1mm"],
+                        help="Dataset identifier: auto, myops380, or myopspp_unet2d_roi128_1mm")
+    parser.add_argument("--label_order", "--label-order", default="auto", choices=["auto", "legacy", "canonical"],
+                        help="Label ordering: auto, legacy, or canonical")
+    parser.add_argument("--data_root", "--data-root", "--data_dir", "--data-dir", default="D:/NCKH/Dataset/MyoPS380/Processed_data")
+    parser.add_argument("--split_dir", "--list_dir", "--split-dir", default="D:/NCKH/SCAR/preprocessing/splits/myops380_no_val")
+    parser.add_argument("--run_dir", "--output_dir", "--save_dir", "--save-dir", "--run-dir", default=None)
 
     # Training recipe
     parser.add_argument("--seed", type=int, default=1234)
@@ -150,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
 
     # Checkpoint & logging
-    parser.add_argument("--resume", default=None, help="Path to checkpoint file or 'auto'")
+    parser.add_argument("--resume", default=None, nargs="?", const="auto", help="Path to checkpoint file or 'auto'")
     parser.add_argument("--save_interval", type=int, default=1, help="Periodic checkpoint save frequency (epochs)")
     parser.add_argument("--epochs_per_run", "--epochs-per-run", type=int, default=0,
                         help="Pause after this many epochs without changing the planned LR budget (0 = finish)")
@@ -175,7 +179,11 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         parser.error("num_workers, epochs_per_run and max_batches must be nonnegative")
     if args.accum_steps != 1:
         parser.error("This multi-head training recipe requires --accum_steps 1")
-    resuming = args.resume is not None and str(args.resume).strip() != ""
+    resuming = (
+        args.resume is not None
+        and str(args.resume).strip() != ""
+        and str(args.resume).strip().lower() not in ("false", "none", "0")
+    )
 
     # 1. Output directory setup
     if args.run_dir is None:
@@ -183,8 +191,6 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     else:
         run_dir = Path(args.run_dir)
     run_dir = run_dir.resolve()
-    if not resuming and run_dir.exists() and any(run_dir.iterdir()):
-        raise FileExistsError("Run directory is not empty; choose a new --run_dir or use --resume")
 
     ckpt_dir = run_dir / "checkpoints"
     log_dir = run_dir / "logs"
@@ -195,6 +201,25 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     logger = setup_logger(log_dir / "train.log")
     checkpoint_path = ckpt_dir / f"myopsnet_seed{args.seed}.pt"
 
+    # Handle smart resume target
+    resume_target: Optional[Path] = None
+    if resuming:
+        resume_str = str(args.resume).strip().lower()
+        if resume_str in ("auto", "true", "1"):
+            if checkpoint_path.is_file():
+                resume_target = checkpoint_path
+            else:
+                logger.info("Auto-resume requested but %s does not exist yet; starting fresh training.", checkpoint_path)
+                resuming = False
+        else:
+            resume_target = Path(args.resume)
+            if not resume_target.is_file():
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_target}")
+    elif checkpoint_path.is_file():
+        logger.info("Existing checkpoint detected at %s. Automatically resuming training.", checkpoint_path)
+        resuming = True
+        resume_target = checkpoint_path
+
     # 2. Hardware and seeding
     seed_everything(args.seed, deterministic=args.deterministic)
     device = resolve_device(args.device)
@@ -203,16 +228,46 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     use_amp = (amp_dtype is not None)
     pin_memory = (device.type == "cuda") if args.pin_memory is None else args.pin_memory
 
+    from utils.paths import resolve_data_root, resolve_split_dir
+
+    resolved_data_root = resolve_data_root(args.data_root, dataset=args.dataset)
+    resolved_split_dir = resolve_split_dir(args.split_dir, dataset=args.dataset, data_root=resolved_data_root)
+
+    is_myopspp = (
+        "myopspp" in str(args.dataset).lower()
+        or "myopspp" in str(resolved_data_root).lower()
+        or "myopspp" in str(resolved_split_dir).lower()
+    )
+    dataset_id = "myopspp_unet2d_roi128_1mm" if is_myopspp else "myops380"
+    benchmark_protocol_id = "myopspp_roi128_train64_test16_no_val_v1" if is_myopspp else "myops380_train304_test76_last_v1"
+
+    if args.label_order != "auto":
+        label_mode = args.label_order
+    elif is_myopspp:
+        label_mode = "canonical"
+    else:
+        label_mode = "legacy"
+
     logger.info("=" * 70)
     logger.info("MyoPS-Net Standardized Training Pipeline")
-    logger.info("Protocol: myops380_train304_test76_last_v1 | Opt Protocol: %s", OPTIMIZATION_PROTOCOL["id"])
+    logger.info("Dataset: %s | Protocol: %s | Label Order: %s", dataset_id, benchmark_protocol_id, label_mode)
+    logger.info("Data Root: %s | Split Dir: %s", resolved_data_root, resolved_split_dir)
     logger.info("Run directory: %s", run_dir)
     logger.info("Device: %s | AMP: %s (%s)", device, amp_mode, amp_dtype)
     logger.info("Seed: %d | Batch size: %d | Planned epochs: %d", args.seed, args.batch_size, args.epochs)
     logger.info("=" * 70)
 
     # 3. DataLoader creation
-    split_file = Path(args.split_dir) / "train.txt"
+    split_file = Path(resolved_split_dir)
+    if split_file.is_dir():
+        split_file = split_file / "train.txt"
+    if not split_file.is_file():
+        local_cand = PROJECT_ROOT / "dataset" / "splits" / dataset_id / "train.txt"
+        if not local_cand.is_file():
+            local_cand = PROJECT_ROOT / "preprocessing" / "splits" / dataset_id / "train.txt"
+        if local_cand.is_file():
+            split_file = local_cand
+            logger.info("Using repository split file: %s", split_file)
     transform = RandomGenerator(output_size=[128, 128])
 
     loader_generator = torch.Generator()
@@ -220,13 +275,15 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
 
     train_loader = create_myops380_train_loader(
         split_file=split_file,
-        data_root=args.data_root,
+        data_root=resolved_data_root,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         transform=transform,
         generator=loader_generator,
+        dataset=dataset_id,
+        label_order=label_mode,
     )
     batches_per_epoch = len(train_loader)
     logger.info("Loaded training data: %d slices across %d batches per epoch", len(train_loader.dataset), batches_per_epoch)
@@ -251,38 +308,34 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     global_step = 0
     amp_skipped_updates = 0
 
-    if resuming:
-        resume_target = checkpoint_path if str(args.resume).strip() in ("auto", "True", "true") else Path(args.resume)
-        if resume_target.is_file():
-            logger.info("Resuming training state from %s ...", resume_target)
-            res = resume_training_state(
-                checkpoint_path=resume_target,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                loader_generator=loader_generator,
-                device=device,
-                expected_resume_contract=resume_contract,
-            )
-            completed_epochs = res["completed_epochs"]
-            start_epoch = res["start_epoch"]
-            global_step = res["global_step"]
-            amp_skipped_updates = res["amp_skipped_updates"]
-            logger.info(
-                "Resumed state: completed_epochs=%d (next epoch=%d), global_step=%d, status=%s",
-                completed_epochs, start_epoch + 1, global_step, res["status"]
-            )
-            if res["status"] == "already_completed" or completed_epochs >= args.epochs:
-                logger.info("Training already complete (%d/%d epochs). Exiting cleanly.", completed_epochs, args.epochs)
-                return {
-                    "completed_epochs": completed_epochs,
-                    "global_step": global_step,
-                    "training_complete": True,
-                    "checkpoint_path": str(resume_target),
-                }
-        else:
-            raise FileNotFoundError(f"Resume checkpoint not found: {resume_target}")
+    if resuming and resume_target is not None and resume_target.is_file():
+        logger.info("Resuming training state from %s ...", resume_target)
+        res = resume_training_state(
+            checkpoint_path=resume_target,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            loader_generator=loader_generator,
+            device=device,
+            expected_resume_contract=resume_contract,
+        )
+        completed_epochs = res["completed_epochs"]
+        start_epoch = res["start_epoch"]
+        global_step = res["global_step"]
+        amp_skipped_updates = res["amp_skipped_updates"]
+        logger.info(
+            "Resumed state: completed_epochs=%d (next epoch=%d), global_step=%d, status=%s",
+            completed_epochs, start_epoch + 1, global_step, res["status"]
+        )
+        if res["status"] == "already_completed" or completed_epochs >= args.epochs:
+            logger.info("Training already complete (%d/%d epochs). Exiting cleanly.", completed_epochs, args.epochs)
+            return {
+                "completed_epochs": completed_epochs,
+                "global_step": global_step,
+                "training_complete": True,
+                "checkpoint_path": str(resume_target),
+            }
 
     # Write config metadata
     config_record = {
@@ -340,7 +393,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
             label = batch["label"].to(device, non_blocking=pin_memory)
             B = label.shape[0]
 
-            target_C0, target_LGE, target_T2 = create_multi_head_targets(label)
+            target_C0, target_LGE, target_T2 = create_multi_head_targets(label, mode=label_mode)
 
             amp_enabled = (use_amp and device.type == "cuda")
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
@@ -477,6 +530,82 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
 
     is_complete = (completed_epochs >= args.epochs)
     logger.info("Training session finished. Checkpoint: %s (completed: %s)", checkpoint_path, is_complete)
+
+    if is_complete:
+        # Load all epoch durations from metrics.jsonl
+        epoch_times: list[float] = []
+        try:
+            with open(log_dir / "metrics.jsonl", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        rec = json.loads(line.strip())
+                        if "epoch_seconds" in rec:
+                            epoch_times.append(float(rec["epoch_seconds"]))
+        except Exception as e:
+            logger.warning("Could not read epoch times from metrics.jsonl: %s", e)
+
+        total_training_seconds = sum(epoch_times)
+        total_training_hours = round(total_training_seconds / 3600.0, 4)
+        avg_epoch_time_6_to_300 = (
+            round(float(np.mean(epoch_times[5:])), 2)
+            if len(epoch_times) > 5
+            else (round(float(np.mean(epoch_times)), 2) if epoch_times else 0.0)
+        )
+        peak_train_vram_gb = (
+            round(torch.cuda.max_memory_allocated(device) / (1024 ** 3), 3)
+            if device.type == "cuda"
+            else 0.0
+        )
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        summary_data = {
+            "model_id": "myopsnet",
+            "model_name": "MyoPS-Net (MyoPSNetL)",
+            "benchmark_protocol": benchmark_protocol_id,
+            "dataset_id": dataset_id,
+            "label_order": label_mode,
+            "seed": args.seed,
+            "max_epochs": args.epochs,
+            "completed_epochs": completed_epochs,
+            "total_updates": total_updates,
+            "global_step": global_step,
+            "amp_skipped_updates": amp_skipped_updates,
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+            "total_training_seconds": total_training_seconds,
+            "total_training_hours": total_training_hours,
+            "avg_epoch_time_epoch_6_to_300_s": avg_epoch_time_6_to_300,
+            "peak_train_vram_gb": peak_train_vram_gb,
+            "epoch_times": epoch_times,
+            "checkpoint_file": str(checkpoint_path.resolve()),
+        }
+
+        # Save summary JSON in run_dir and ckpt_dir
+        for summary_dir in (run_dir, ckpt_dir):
+            sum_path = summary_dir / f"training_summary_seed{args.seed}.json"
+            try:
+                with open(sum_path, "w", encoding="utf-8") as f:
+                    json.dump(summary_data, f, indent=2)
+                logger.info("Saved training summary to: %s", sum_path)
+            except Exception as e:
+                logger.warning("Failed to save summary to %s: %s", sum_path, e)
+
+        # Auto-run benchmark_efficiency if available
+        try:
+            from benchmark_efficiency import run_benchmark
+            eff_output = Path("outputs/runs/myopsnet/efficiency_metrics.json")
+            run_benchmark(
+                checkpoint_path=checkpoint_path,
+                output_path=eff_output,
+                summary_path=ckpt_dir / f"training_summary_seed{args.seed}.json",
+                device_name=str(device),
+                seed=args.seed,
+                dataset=dataset_id,
+            )
+        except Exception as e:
+            logger.info("Auto-benchmark efficiency note: %s", e)
+
     return {
         "completed_epochs": completed_epochs,
         "global_step": global_step,
