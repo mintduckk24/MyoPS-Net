@@ -247,3 +247,52 @@ class TestBenchmarkEfficiencyTool:
         inf_res = measure_inference(model, device=device, warmup_runs=2, measure_runs=3)
         assert "latency_ms_per_slice" in inf_res
         assert inf_res["latency_ms_per_slice"] > 0
+
+
+class TestAugmentationInvariance:
+    """Verifies that RandomGenerator augmentation strictly preserves label values and dimensions."""
+
+    def test_random_generator_preserves_label_set(self):
+        from dataset.augmentation import RandomGenerator
+        aug = RandomGenerator(output_size=[128, 128])
+        sample = {
+            "image": np.random.rand(128, 128).astype(np.float32),
+            "image1": np.random.rand(128, 128).astype(np.float32),
+            "image2": np.random.rand(128, 128).astype(np.float32),
+            "label": np.random.choice([0, 1, 2, 3], size=(128, 128)).astype(np.int64),
+        }
+        res = aug(sample)
+        assert set(np.unique(res["label"])).issubset({0, 1, 2, 3})
+        assert res["image"].shape == (1, 128, 128)
+        assert res["label"].shape == (128, 128)
+
+
+class TestPredictPathFallback:
+    """Verifies that predict.py resolve_paths handles nested checkpoints and missing dirs."""
+
+    def test_resolve_paths_fallback(self, tmp_path):
+        from predict import resolve_paths
+        import argparse
+
+        run_dir = tmp_path / "test_run"
+        ckpt_dir = run_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True)
+        ckpt_file = ckpt_dir / "myopsnet_seed1234.pt"
+        ckpt_file.write_text("dummy", encoding="utf-8")
+
+        # Passing checkpoint pointing to run_dir/<name> directly when it only exists in checkpoints/<name>
+        dummy_cp = run_dir / "myopsnet_seed1234.pt"
+        args = argparse.Namespace(
+            checkpoint=str(dummy_cp),
+            run_dir=None,
+            seed=1234,
+            pred_dir=None,
+            dataset="auto",
+            data_root=str(tmp_path),
+            split_dir=str(tmp_path),
+            split="test_vol",
+            test_manifest=None,
+        )
+        resolved_cp, _, _, _, _, _, _ = resolve_paths(args)
+        assert resolved_cp == ckpt_file.resolve()
+

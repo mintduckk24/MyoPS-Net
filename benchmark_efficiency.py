@@ -257,7 +257,7 @@ def extract_training_metrics(
                         for line in f:
                             if line.strip():
                                 rec = json.loads(line.strip())
-                                if "epoch_seconds" in rec:
+                                if ("seed" not in rec or rec.get("seed") == seed) and "epoch_seconds" in rec:
                                     epoch_seconds.append(float(rec["epoch_seconds"]))
                     if epoch_seconds:
                         if len(epoch_seconds) > 5:
