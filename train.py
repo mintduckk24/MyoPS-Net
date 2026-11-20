@@ -192,9 +192,14 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         run_dir = Path(args.run_dir)
     run_dir = run_dir.resolve()
 
-    ckpt_dir = run_dir / "checkpoints"
-    log_dir = run_dir / "logs"
-    tb_dir = run_dir / "tensorboard"
+    if run_dir.name == "checkpoints":
+        ckpt_dir = run_dir
+        log_dir = run_dir.parent / "logs"
+        tb_dir = run_dir.parent / "tensorboard"
+    else:
+        ckpt_dir = run_dir / "checkpoints"
+        log_dir = run_dir / "logs"
+        tb_dir = run_dir / "tensorboard"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,6 +213,8 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         if resume_str in ("auto", "true", "1"):
             if checkpoint_path.is_file():
                 resume_target = checkpoint_path
+            elif (run_dir / f"myopsnet_seed{args.seed}.pt").is_file():
+                resume_target = run_dir / f"myopsnet_seed{args.seed}.pt"
             else:
                 logger.info("Auto-resume requested but %s does not exist yet; starting fresh training.", checkpoint_path)
                 resuming = False
@@ -219,6 +226,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         logger.info("Existing checkpoint detected at %s. Automatically resuming training.", checkpoint_path)
         resuming = True
         resume_target = checkpoint_path
+    elif (run_dir / f"myopsnet_seed{args.seed}.pt").is_file():
+        resume_target = run_dir / f"myopsnet_seed{args.seed}.pt"
+        logger.info("Existing checkpoint detected at %s. Automatically resuming training.", resume_target)
+        resuming = True
 
     # 2. Hardware and seeding
     seed_everything(args.seed, deterministic=args.deterministic)
@@ -232,6 +243,8 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
 
     resolved_data_root = resolve_data_root(args.data_root, dataset=args.dataset)
     resolved_split_dir = resolve_split_dir(args.split_dir, dataset=args.dataset, data_root=resolved_data_root)
+    args.data_root = str(resolved_data_root)
+    args.split_dir = str(resolved_split_dir)
 
     is_myopspp = (
         "myopspp" in str(args.dataset).lower()
@@ -494,6 +507,14 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                 loss_contract=LOSS_CONTRACT,
                 rng_policy=RNG_POLICY,
             )
+            if ckpt_dir != run_dir:
+                alt_ckpt = run_dir / f"myopsnet_seed{args.seed}.pt"
+                try:
+                    if alt_ckpt.resolve() != checkpoint_path.resolve():
+                        import shutil
+                        shutil.copy2(checkpoint_path, alt_ckpt)
+                except Exception:
+                    pass
 
         # Record tabular metrics
         record = {

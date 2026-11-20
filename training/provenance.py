@@ -73,12 +73,34 @@ def _file_sha256(path: Path) -> str:
 
 def build_resume_contract(args, dataset, *, device, amp_dtype, pin_memory: bool) -> dict:
     """Hash training cache bytes read-only; never load or run the model on test data."""
-    root = Path(args.data_root)
+    root = Path(getattr(dataset, "data_root", args.data_root))
     digest = hashlib.sha256()
-    for modality in MODEL_CONTRACT["modalities"]:
-        for name in sorted(dataset.slices):
-            relative = f"{modality}/train_npz/{name}.npz"
-            digest.update(f"{relative}\0{_file_sha256(root / relative)}\n".encode("utf-8"))
+    if getattr(dataset, "is_nifti_export", False):
+        for manifest_name in ("dataset_manifest.json", "checksums.sha256"):
+            p = root / manifest_name
+            if p.is_file():
+                digest.update(f"{manifest_name}\0{_file_sha256(p)}\n".encode("utf-8"))
+        nifti_dir = getattr(dataset, "nifti_cases_dir", root / "cases")
+        for pat in sorted(getattr(dataset, "patients", [])):
+            center = "CenterB" if pat.startswith("Case2") else "CenterC"
+            case_dir = nifti_dir / center / pat
+            if not case_dir.is_dir():
+                case_dir = nifti_dir / pat
+            for suffix in ("_C0.nii.gz", "_LGE.nii.gz", "_T2.nii.gz", "_gd.nii.gz"):
+                nii_p = case_dir / f"{pat}{suffix}"
+                if nii_p.is_file():
+                    digest.update(f"{pat}{suffix}\0{_file_sha256(nii_p)}\n".encode("utf-8"))
+                else:
+                    digest.update(f"{pat}{suffix}\0missing\n".encode("utf-8"))
+    else:
+        for modality in MODEL_CONTRACT["modalities"]:
+            for name in sorted(getattr(dataset, "slices", [])):
+                relative = f"{modality}/train_npz/{name}.npz"
+                npz_p = root / relative
+                if npz_p.is_file():
+                    digest.update(f"{relative}\0{_file_sha256(npz_p)}\n".encode("utf-8"))
+                else:
+                    digest.update(f"{relative}\0missing\n".encode("utf-8"))
     source_root = Path(__file__).resolve().parents[1]
     settings = {key: getattr(args, key) for key in _SETTING_KEYS}
     settings.update(device_type=device.type, amp_dtype=str(amp_dtype), pin_memory=pin_memory)
@@ -86,6 +108,8 @@ def build_resume_contract(args, dataset, *, device, amp_dtype, pin_memory: bool)
     processed = min(batches, 2) if args.dry_run else batches
     if args.max_batches:
         processed = min(processed, args.max_batches)
+    split_p = Path(dataset.split_file) if hasattr(dataset, "split_file") and dataset.split_file else None
+    split_sha = _file_sha256(split_p) if (split_p and split_p.is_file()) else ""
     return {
         "version": 1,
         "settings": settings,
@@ -94,10 +118,10 @@ def build_resume_contract(args, dataset, *, device, amp_dtype, pin_memory: bool)
         "processed_batches_per_epoch": processed,
         "data": {
             "train_slices": len(dataset),
-            "train_manifest_sha256": _file_sha256(Path(dataset.split_file)),
+            "train_manifest_sha256": split_sha,
             "train_cache_sha256": digest.hexdigest(),
         },
-        "source_sha256": {name: _file_sha256(source_root / name) for name in _SOURCE_FILES},
+        "source_sha256": {name: (_file_sha256(source_root / name) if (source_root / name).is_file() else "") for name in _SOURCE_FILES},
         "runtime": {
             "python": platform.python_version(), "torch": str(torch.__version__),
             "numpy": np.__version__, "scipy": scipy.__version__, "cuda": torch.version.cuda,

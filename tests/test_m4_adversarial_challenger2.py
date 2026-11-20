@@ -44,7 +44,12 @@ from evaluate_predictions import (
 )
 
 # Dynamically import the real, read-only SCAR reference implementation
-SCAR_METRICS_PATH = Path("D:/NCKH/SCAR/training/metrics/surface_distance.py")
+SCAR_CANDIDATES = [
+    Path("D:/nckh_model/SCAR/training/metrics/surface_distance.py"),
+    Path("D:/NCKH/SCAR/training/metrics/surface_distance.py"),
+    Path(__file__).resolve().parents[2] / "SCAR" / "training" / "metrics" / "surface_distance.py",
+]
+SCAR_METRICS_PATH = next((p for p in SCAR_CANDIDATES if p.is_file()), SCAR_CANDIDATES[0])
 assert SCAR_METRICS_PATH.is_file(), f"SCAR reference file not found at {SCAR_METRICS_PATH}"
 _spec = importlib.util.spec_from_file_location("scar_surface_distance_ref", str(SCAR_METRICS_PATH))
 scar_sd = importlib.util.module_from_spec(_spec)

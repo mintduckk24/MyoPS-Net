@@ -26,8 +26,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-SCAR_ROOT = Path("D:/NCKH/SCAR")
-DATASET_ROOT = Path("D:/NCKH/Dataset/MyoPS380/Processed_data")
+SCAR_ROOT = Path("D:/nckh_model/SCAR") if Path("D:/nckh_model/SCAR").exists() else Path("D:/NCKH/SCAR")
+DATASET_ROOT = Path("D:/nckh_model/Dataset/MyoPS380/Processed_data") if Path("D:/nckh_model/Dataset/MyoPS380/Processed_data").exists() else Path("D:/NCKH/Dataset/MyoPS380/Processed_data")
 SPLIT_ROOT = SCAR_ROOT / "preprocessing/splits/myops380_no_val"
 
 

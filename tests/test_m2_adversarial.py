@@ -52,8 +52,8 @@ from dataset.myops380_dataset import (
 )
 from dataset.augmentation import RandomGenerator, ResizeGenerator
 
-DEFAULT_SPLITS_DIR = Path("D:/NCKH/SCAR/preprocessing/splits/myops380_no_val")
-DEFAULT_DATA_ROOT = Path("D:/NCKH/Dataset/MyoPS380/Processed_data")
+DEFAULT_SPLITS_DIR = Path("D:/nckh_model/SCAR/preprocessing/splits/myops380_no_val") if Path("D:/nckh_model/SCAR/preprocessing/splits/myops380_no_val").exists() else Path("D:/NCKH/SCAR/preprocessing/splits/myops380_no_val")
+DEFAULT_DATA_ROOT = Path("D:/nckh_model/Dataset/MyoPS380/Processed_data") if Path("D:/nckh_model/Dataset/MyoPS380/Processed_data").exists() else Path("D:/NCKH/Dataset/MyoPS380/Processed_data")
 
 SPLITS_DIR = Path(os.environ.get("MYOPS_SPLITS_DIR", str(DEFAULT_SPLITS_DIR)))
 DATA_ROOT = Path(os.environ.get("MYOPS_DATA_ROOT", str(DEFAULT_DATA_ROOT)))

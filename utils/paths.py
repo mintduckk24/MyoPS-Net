@@ -5,18 +5,27 @@ import os
 from pathlib import Path
 
 
+def _is_default_placeholder(path_str: str) -> bool:
+    s = str(path_str).replace("\\", "/")
+    return "NCKH" in s
+
+
 def resolve_split_dir(
     candidate: str | Path | None = None,
     dataset: str = "auto",
     data_root: str | Path | None = None,
 ) -> Path:
-    """Resolves split directory containing train.txt and test_vol.txt."""
+    """Resolves split directory containing train.txt, test_vol.txt, or splits.json."""
     if candidate and str(candidate).strip():
         p = Path(candidate)
-        if p.is_dir() and ((p / "train.txt").is_file() or (p / "splits.json").is_file()):
+        if p.is_file():
+            return p.parent
+        if p.is_dir():
+            if (p / "lists").is_dir() and ((p / "lists" / "train.txt").is_file() or (p / "lists" / "test_vol.txt").is_file()):
+                return p / "lists"
             return p
-        if (p / "lists").is_dir() and (p / "lists" / "train.txt").is_file():
-            return p / "lists"
+        if not _is_default_placeholder(str(candidate)):
+            return p
 
     is_myopspp = (
         "myopspp" in str(candidate).lower()
@@ -79,6 +88,9 @@ def resolve_data_root(candidate: str | Path | None = None, dataset: str = "auto"
                 return p
             if (p / "dataset_manifest.json").is_file():
                 return p
+            return p
+        if not _is_default_placeholder(str(candidate)):
+            return p
 
     is_explicit_myops380 = "myops380" in str(dataset).lower()
     is_explicit_myopspp = "myopspp" in str(dataset).lower()

@@ -229,9 +229,7 @@ class MyoPS380TrainDataset(Dataset):
         self.dataset_id = "myopspp_unet2d_roi128_1mm" if is_myopspp else "myops380"
 
         # Resolve split file
-        try:
-            self.split_file = resolve_split_file(split_file, "train.txt")
-        except FileNotFoundError:
+        if split_file is None:
             repo_root = Path(__file__).resolve().parent.parent
             if is_myopspp:
                 cand_split = repo_root / "dataset" / "splits" / "myopspp_unet2d_roi128_1mm" / "train.txt"
@@ -241,10 +239,9 @@ class MyoPS380TrainDataset(Dataset):
                 cand_split = repo_root / "preprocessing" / "splits" / "myops380_no_val" / "train.txt"
                 if not cand_split.is_file():
                     cand_split = repo_root / "dataset" / "splits" / "myops380_no_val" / "train.txt"
-            if cand_split.is_file():
-                self.split_file = cand_split
-            else:
-                raise
+            self.split_file = cand_split
+        else:
+            self.split_file = resolve_split_file(split_file, "train.txt")
 
         self.transform = transform
         self.slices: List[str] = read_manifest_lines(self.split_file)
@@ -407,7 +404,7 @@ class MyoPS380TrainDataset(Dataset):
                 t2w = ingest_image_array(d_t2w["image"], name=f"{slice_id}_t2w")
 
             label = np.round(label).astype(np.int64)
-            if self.source_order == "legacy":
+            if self.source_order == "canonical":
                 label = canonicalize_label(label, source_order="legacy")
 
         if self.transform is not None:
@@ -494,9 +491,7 @@ class MyoPS380TestDataset(Dataset):
         )
         self.dataset_id = "myopspp_unet2d_roi128_1mm" if is_myopspp else "myops380"
 
-        try:
-            self.split_file = resolve_split_file(split_file, "test_vol.txt")
-        except FileNotFoundError:
+        if split_file is None:
             repo_root = Path(__file__).resolve().parent.parent
             if is_myopspp:
                 cand_split = repo_root / "dataset" / "splits" / "myopspp_unet2d_roi128_1mm" / "test_vol.txt"
@@ -506,10 +501,9 @@ class MyoPS380TestDataset(Dataset):
                 cand_split = repo_root / "preprocessing" / "splits" / "myops380_no_val" / "test_vol.txt"
                 if not cand_split.is_file():
                     cand_split = repo_root / "dataset" / "splits" / "myops380_no_val" / "test_vol.txt"
-            if cand_split.is_file():
-                self.split_file = cand_split
-            else:
-                raise
+            self.split_file = cand_split
+        else:
+            self.split_file = resolve_split_file(split_file, "test_vol.txt")
 
         self.canonical_label = canonical_label
         raw_cases = read_manifest_lines(self.split_file)

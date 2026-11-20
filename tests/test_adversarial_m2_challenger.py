@@ -38,9 +38,29 @@ from dataset.myops380_dataset import (
 )
 
 # Reference SCAR paths
-SCAR_DATASET_PY = Path("D:/NCKH/SCAR/training/dataset/myops_dataset.py")
-TRAIN_SPLIT_FILE = Path("D:/NCKH/SCAR/preprocessing/splits/myops380_no_val/train.txt")
-DATA_ROOT = Path("D:/NCKH/Dataset/MyoPS380/Processed_data")
+def _find_first_existing(paths, default):
+    for p in paths:
+        if p.exists():
+            return p
+    return default
+
+SCAR_DATASET_PY = _find_first_existing([
+    Path("D:/nckh_model/SCAR/training/dataset/myops_dataset.py"),
+    Path("D:/NCKH/SCAR/training/dataset/myops_dataset.py"),
+    Path(__file__).resolve().parents[2] / "SCAR" / "training" / "dataset" / "myops_dataset.py",
+], Path("D:/nckh_model/SCAR/training/dataset/myops_dataset.py"))
+
+TRAIN_SPLIT_FILE = _find_first_existing([
+    Path("D:/nckh_model/SCAR/preprocessing/splits/myops380_no_val/train.txt"),
+    Path("D:/NCKH/SCAR/preprocessing/splits/myops380_no_val/train.txt"),
+    Path(__file__).resolve().parents[2] / "SCAR" / "preprocessing" / "splits" / "myops380_no_val" / "train.txt",
+], Path("D:/nckh_model/SCAR/preprocessing/splits/myops380_no_val/train.txt"))
+
+DATA_ROOT = _find_first_existing([
+    Path("D:/nckh_model/Dataset/MyoPS380/Processed_data"),
+    Path("D:/NCKH/Dataset/MyoPS380/Processed_data"),
+    Path(__file__).resolve().parents[2] / "Dataset" / "MyoPS380" / "Processed_data",
+], Path("D:/nckh_model/Dataset/MyoPS380/Processed_data"))
 
 
 def load_scar_components():
